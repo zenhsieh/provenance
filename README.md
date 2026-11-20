@@ -136,4 +136,4 @@ If pytest is available, `pytest -q tests` runs the same cases. No real session c
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 zenhsieh.
