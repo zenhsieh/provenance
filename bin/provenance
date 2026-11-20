@@ -1,0 +1,998 @@
+#!/usr/bin/env python3
+"""Verify human quotes against local conversation logs."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import math
+import mmap
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+from statistics import median
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+HUMAN_QUOTE = re.compile(r"(?:⟦U\s+|𝕌)(.+?)⟧", re.DOTALL)
+PASTED_CONTENT = re.compile(r"<pasted_content\b[^>]*>.*?</pasted_content(?:\s+[^>]*)?>", re.DOTALL)
+QUOTE = re.compile(r"^(?:⟦U\s+|𝕌)(.+?)⟧$", re.DOTALL)
+AGENT_MARKER = re.compile(r"𝗚𝗲|[𝗖𝗫𝗚]")
+LEGACY = re.compile(r"^(\d{2})(\d{2})\s+(\d{2}):(\d[0-9xX])\s+(.+)$", re.DOTALL)
+PLAIN = re.compile(
+    r"^\s*(?:\[([^\]]+)\]|(\S+))\s+(?:USER|HUMAN|user|human):\s*(.*?)\s*$"
+)
+RELAY_HEADER = re.compile(
+    r"^(?:【[^】\n]+(?:→|｜)[^】\n]+】"
+    r"|■\s*\d{1,2}:\d{2}\s+[^\s｜\n]+(?:[｜\s]|$)"
+    r"|[^\s→：:\n]+\s*→\s*[^\s→：:\n]+\s*[：:]"
+    r"|⟨[^⟩\n]+?\s+轉交⟩)"
+)
+REDUNDANT_QUOTE_PREFIX = re.compile(r"(?:user|使用者|用戶)\s*(?:\d{1,2}:\d{2}\s*)?原話\s*[：:]\s*$", re.IGNORECASE)
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+HUMAN_CLAIM = re.compile(
+    r"\b(?:the\s+)?(?:user|human|operator)\s+(?:has\s+)?(?:approved|authorized|decided|agreed|confirmed|requested|instructed)\b"
+    r"|(?:使用者|用戶|人類|user)\s*(?:已|有)?\s*(?:核准|批准|同意|決定|要求|指示|說可以)",
+    re.IGNORECASE,
+)
+INFERENCE_IN_QUOTE = re.compile(
+    r"[⟪⟫⦅⦆⟬⟭]|𝗚𝗲|[𝗖𝗫𝗚]"
+    r"|\b(?:agent\s+(?:infers?|concludes?|assumes?)|my\s+inference|I\s+infer|presumably\s+he|he|she|the\s+user)\b"
+    r"|(?:代理|模型|agent)\s*(?:推論|判斷|認為)"
+    r"|我(?:推測|判斷|認為他)"
+    r"|(?:他|她)(?:也|會|同意|想|要)|user\s*也",
+    re.IGNORECASE,
+)
+LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s+")
+SOURCE_REF = re.compile(r"(?i)(?<![\w-])(?P<kind>source|session|src)\s*[:=]\s*(?P<value>\"[^\"]+\"|'[^']+'|[^\s,;]+)")
+PENDING_PREFIX = re.compile(r"(?:待|等|由|讓|請|交給|要不要(?:由|讓)?)\s*$", re.IGNORECASE)
+
+
+class AmbiguousSource(ValueError):
+    def __init__(self, paths: list[Path]):
+        self.paths = paths
+        super().__init__("src reference matches multiple sessions")
+
+
+def normalize(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def delivery_normalize(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).replace("\r\n", "\n").strip()
+    return " ".join(value.split())
+
+
+def contains_quote(message: str, words: str) -> bool:
+    haystack, needle = normalize(message), normalize(words)
+    if not needle:
+        return False
+    start = 0
+    while (at := haystack.find(needle, start)) >= 0:
+        end = at + len(needle)
+        left_ok = at == 0 or word_boundary(needle[0], haystack[at - 1])
+        right_ok = end == len(haystack) or word_boundary(needle[-1], haystack[end])
+        if left_ok and right_ok:
+            return True
+        start = at + 1
+    return False
+
+
+def contains_origin_quote(message: str, words: str) -> bool:
+    """A citation embedded in a message is evidence of a relay, not its source."""
+    return contains_quote(HUMAN_QUOTE.sub(" ", PASTED_CONTENT.sub(" ", message)), words)
+
+
+def word_boundary(left: str, right: str) -> bool:
+    def is_word(char: str) -> bool:
+        return char.isalnum() or char == "_"
+
+    def is_cjk(char: str) -> bool:
+        return unicodedata.name(char, "").startswith(("CJK", "HIRAGANA", "KATAKANA", "HANGUL", "BOPOMOFO"))
+
+    return not (is_word(left) and is_word(right)) or is_cjk(left) or is_cjk(right)
+
+
+def parse_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else None
+
+
+def parse_quote(value: str) -> tuple[str, str, datetime | tuple[int, int, int, str]]:
+    match = QUOTE.fullmatch(value.strip())
+    if not match:
+        raise ValueError("expected one 𝕌…⟧ or ⟦U …⟧ quote")
+    body = match.group(1).strip()
+    if body.startswith("#"):
+        raise ValueError("card pointers require the underlying quoted words and time")
+    iso = re.match(r'^(\S+)\s+"(.*)"$', body, re.DOTALL)
+    if iso:
+        expected = parse_time(iso.group(1))
+        if expected is None:
+            raise ValueError("ISO quote requires a timezone offset")
+        words = iso.group(2)
+        if not words.strip():
+            raise ValueError("empty quote")
+        return words, "iso", expected
+    legacy = LEGACY.fullmatch(body)
+    if not legacy:
+        raise ValueError("expected ISO timestamp and quoted words, or MMDD HH:MM words")
+    month, day, hour, minute, words = legacy.groups()
+    if not words.strip() or not (1 <= int(month) <= 12 and 1 <= int(day) <= 31 and int(hour) <= 23):
+        raise ValueError("invalid legacy quote")
+    if minute[-1] in "xX":
+        if int(minute[0]) > 5:
+            raise ValueError("invalid minute window")
+    elif int(minute) > 59:
+        raise ValueError("invalid minute")
+    return words, "legacy", (int(month), int(day), int(hour), minute.lower())
+
+
+def parse_hook_quote(value: str):
+    """Accept an untimed new-style quote while keeping strict CLI verification."""
+    try:
+        return parse_quote(value)
+    except ValueError:
+        match = QUOTE.fullmatch(value.strip())
+        if not match or not value.startswith("𝕌") or not match.group(1).strip() or match.group(1).lstrip().startswith("#"):
+            raise
+        return match.group(1).strip(), "missing", None
+
+
+def parse_timezone(value: str):
+    offset = re.fullmatch(r"([+-])(\d{2}):(\d{2})", value)
+    if offset:
+        hours, minutes = int(offset.group(2)), int(offset.group(3))
+        if hours > 23 or minutes > 59:
+            raise ValueError("invalid timezone offset")
+        delta = timedelta(hours=hours, minutes=minutes)
+        return timezone(delta if offset.group(1) == "+" else -delta)
+    try:
+        return ZoneInfo(value)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"unknown timezone: {value}") from exc
+
+
+def in_time_window(actual: datetime, kind: str, expected: datetime | tuple[int, int, int, str], local_tz) -> bool:
+    if kind == "iso":
+        assert isinstance(expected, datetime)
+        return abs(actual - expected) <= timedelta(minutes=5)
+    assert isinstance(expected, tuple)
+    actual = actual.astimezone(local_tz)
+    month, day, hour, minute = expected
+    if minute.endswith("x"):
+        return (actual.month, actual.day, actual.hour) == (month, day, hour) and actual.minute // 10 == int(minute[0])
+    try:
+        target = actual.replace(month=month, day=day, hour=hour, minute=int(minute), second=0, microsecond=0)
+    except ValueError:
+        return False
+    return abs(actual - target) <= timedelta(minutes=5)
+
+
+def content_text(content: object) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if any(isinstance(item, dict) and item.get("type") in ("tool_result", "tool_use", "output_text") for item in content):
+            return None
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") in ("text", "input_text"):
+                value = item.get("text")
+                if isinstance(value, str):
+                    parts.append(value)
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def human_entry(entry: object) -> tuple[datetime, str] | None:
+    if not isinstance(entry, dict):
+        return None
+    stamp = parse_time(str(entry.get("timestamp", "")))
+    if stamp is None:
+        return None
+    typ = entry.get("type")
+    payload = entry.get("payload")
+    if typ == "attachment" and isinstance(entry.get("attachment"), dict):
+        attachment = entry["attachment"]
+        origin = attachment.get("origin")
+        if attachment.get("type") != "queued_command" or not isinstance(origin, dict) or origin.get("kind") != "human" or attachment.get("humanTurn") is not True:
+            return None
+        value = attachment.get("prompt")
+    elif typ == "event_msg" and isinstance(payload, dict) and payload.get("type") == "user_message":
+        value = payload.get("message")
+    elif typ == "response_item" and isinstance(payload, dict) and payload.get("type") == "message" and payload.get("role") == "user":
+        value = content_text(payload.get("content"))
+    elif typ == "user" and isinstance(entry.get("message"), dict) and entry["message"].get("role") == "user":
+        value = content_text(entry["message"].get("content"))
+    else:
+        return None
+    return (stamp, value) if isinstance(value, str) else None
+
+
+def load_delivery_hashes(path: str | None = None, deadline: float | None = None,
+                         diagnostics: list[str] | None = None) -> set[str]:
+    record_path = Path(path or os.environ.get("PROVENANCE_DELIVERY_LOG", "~/.local/state/provenance/deliveries.jsonl")).expanduser()
+    if not record_path.exists():
+        if path:
+            raise FileNotFoundError(record_path)
+        return set()
+    hashes = set()
+    invalid_count = 0
+    first_invalid = 0
+    with record_path.open("rb") as stream:
+        for number, line in enumerate(stream, 1):
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError("delivery scan exceeded hook time budget")
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict) or not isinstance(record.get("ts"), str):
+                    raise ValueError("invalid delivery record shape")
+                digest = record["text_sha256"]
+                if not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest):
+                    raise ValueError("invalid sha256")
+                stamp = parse_time(record["ts"])
+                if record["v"] != 1 or record["norm"] != "nfkc-ws1" or stamp is None or stamp.utcoffset() != timedelta(0):
+                    raise ValueError("invalid delivery version, normalization, or timestamp")
+                if record["tool"] not in ("agent-bridge", "message-relay"):
+                    raise ValueError("invalid delivery tool")
+                if not isinstance(record["from"], str) or not isinstance(record["to"], str) or not record["to"] or not isinstance(record["to_pane"], str):
+                    raise ValueError("invalid delivery fields")
+                if not isinstance(record["text_len"], int) or isinstance(record["text_len"], bool) or record["text_len"] < 0:
+                    raise ValueError("invalid text length")
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                invalid_count += 1
+                if not first_invalid:
+                    first_invalid = number
+                continue
+            hashes.add(digest)
+    if invalid_count:
+        warning = f"InvalidDeliveryRecord count={invalid_count} first={record_path}:{first_invalid}"
+        print(f"provenance: {warning}", file=sys.stderr)
+        if diagnostics is not None:
+            diagnostics.append(warning)
+    return hashes
+
+
+def is_agent_relay(content: str, delivery_hashes: set[str]) -> bool:
+    digest = hashlib.sha256(delivery_normalize(content).encode("utf-8")).hexdigest()
+    return bool(RELAY_HEADER.match(content.lstrip())) or digest in delivery_hashes
+
+
+def log_lines(path: Path, delivery_hashes: set[str] | None = None, deadline: float | None = None):
+    if delivery_hashes is None:
+        delivery_hashes = load_delivery_hashes(deadline=deadline)
+    with path.open("rb") as stream:
+        offset = 0
+        for line_number, raw in enumerate(stream, 1):
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError("session scan exceeded hook time budget")
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                offset += len(raw)
+                continue
+            if path.suffix == ".jsonl":
+                try:
+                    record = human_entry(json.loads(line))
+                except json.JSONDecodeError:
+                    record = None
+            else:
+                match = PLAIN.fullmatch(line.rstrip("\r\n"))
+                stamp = parse_time(match.group(1) or match.group(2)) if match else None
+                record = (stamp, match.group(3)) if stamp and match else None
+            if record and not is_agent_relay(record[1], delivery_hashes):
+                yield line_number, offset, raw, record
+            offset += len(raw)
+
+
+def matching_log_lines(path: Path, fragment: str, delivery_hashes: set[str], deadline: float):
+    """Inspect only JSONL lines containing the verbatim UTF-8 fragment."""
+    needles = {fragment.encode("utf-8"), json.dumps(fragment, ensure_ascii=True)[1:-1].encode("ascii")}
+    if not fragment:
+        return
+    with path.open("rb") as stream:
+        if not stream.seek(0, os.SEEK_END):
+            return
+        stream.seek(0)
+        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            seen = set()
+            for needle in needles:
+                search_at = 0
+                while (at := data.find(needle, search_at)) >= 0:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("session lookup exceeded time budget")
+                    line_start = data.rfind(b"\n", 0, at) + 1
+                    line_end = data.find(b"\n", at)
+                    if line_end < 0:
+                        line_end = len(data)
+                    search_at = line_end + 1
+                    if line_start in seen:
+                        continue
+                    seen.add(line_start)
+                    line_number = data[:line_start].count(b"\n") + 1
+                    raw = data[line_start:line_end] + (b"\n" if line_end < len(data) else b"")
+                    try:
+                        line = raw.decode("utf-8")
+                        if path.suffix == ".jsonl":
+                            record = human_entry(json.loads(line))
+                        else:
+                            plain = PLAIN.fullmatch(line.rstrip("\r\n"))
+                            stamp = parse_time(plain.group(1) or plain.group(2)) if plain else None
+                            record = (stamp, plain.group(3)) if stamp and plain else None
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        record = None
+                    if record and not is_agent_relay(record[1], delivery_hashes):
+                        yield line_number, line_start, raw, record
+
+
+def resolve_session(session_id: str) -> list[Path]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+        raise ValueError("session id must contain only letters, digits, underscores, or hyphens")
+    home = Path.home()
+    patterns = [
+        str(home / ".claude" / "projects" / "*" / f"{session_id}.jsonl"),
+        str(home / ".codex" / "sessions" / "*" / "*" / "*" / f"*{session_id}.jsonl"),
+    ]
+    return sorted({Path(item) for pattern in patterns for item in glob.glob(pattern)})
+
+
+def session_id_for_path(path: Path) -> str | None:
+    home = Path.home()
+    try:
+        relative = path.resolve().relative_to((home / ".claude" / "projects").resolve())
+        if len(relative.parts) == 2 and path.suffix == ".jsonl":
+            return path.stem
+    except ValueError:
+        pass
+    try:
+        relative = path.resolve().relative_to((home / ".codex" / "sessions").resolve())
+        if len(relative.parts) == 4 and path.suffix == ".jsonl" and path.stem.startswith("rollout-"):
+            match = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27})$", path.stem)
+            return match.group(1) if match else path.stem.rsplit("-", 1)[-1]
+    except ValueError:
+        pass
+    return None
+
+
+def source_reference(path: Path, line: int) -> str:
+    session_id = session_id_for_path(path)
+    return f"src: {session_id[:8]}:{line}" if session_id and len(session_id) >= 8 else f"source: {path.resolve()} line {line}"
+
+
+def recent_sessions(days: int, deadline: float) -> list[Path]:
+    if days < 1 or days > 365:
+        raise ValueError("--days must be between 1 and 365")
+    cutoff = time.time() - days * 86400
+    home = Path.home()
+    candidates = []
+    for path in (home / ".claude" / "projects").glob("*/*.jsonl"):
+        if time.monotonic() > deadline:
+            raise TimeoutError("session lookup exceeded time budget")
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        if modified >= cutoff:
+            candidates.append((modified, path))
+    today = datetime.now().astimezone().date()
+    first = datetime.fromtimestamp(cutoff).astimezone().date()
+    for ordinal in range(first.toordinal(), today.toordinal() + 1):
+        day = datetime.fromordinal(ordinal)
+        directory = home / ".codex" / "sessions" / day.strftime("%Y/%m/%d")
+        for path in directory.glob("*.jsonl"):
+            if time.monotonic() > deadline:
+                raise TimeoutError("session lookup exceeded time budget")
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            if modified >= cutoff:
+                candidates.append((modified, path))
+    return [path for _, path in sorted(candidates, key=lambda item: item[0], reverse=True)]
+
+
+def resolve_short_reference(value: str) -> tuple[Path, int]:
+    match = re.fullmatch(r"src:\s*([A-Za-z0-9_-]{8}):([1-9][0-9]*)", value.strip())
+    if not match:
+        raise ValueError("invalid src reference; expected src: <session8>:<line>")
+    prefix, line = match.group(1), int(match.group(2))
+    home = Path.home()
+    paths = list((home / ".claude" / "projects").glob(f"*/{prefix}*.jsonl"))
+    paths += list((home / ".codex" / "sessions").glob(f"*/*/*/*{prefix}*.jsonl"))
+    paths = [path for path in paths if (session_id_for_path(path) or "").startswith(prefix)]
+    if len(paths) > 1:
+        raise AmbiguousSource(paths)
+    if not paths:
+        raise ValueError("src reference matched no session")
+    return paths[0], line
+
+
+def source_paths(args: argparse.Namespace, deadline: float | None = None) -> tuple[list[Path], int | None]:
+    if args.source:
+        if args.source.startswith("src:"):
+            path, line = resolve_short_reference(args.source)
+            return [path], line
+        return [Path(args.source)], None
+    if args.session:
+        return resolve_session(args.session), None
+    assert deadline is not None
+    return recent_sessions(args.days, deadline), None
+
+
+def verify(args: argparse.Namespace) -> int:
+    try:
+        words, kind, expected = parse_quote(args.quote)
+        local_tz = parse_timezone(args.tz)
+        deadline = time.monotonic() + 1.0 if not args.source and not args.session else None
+        delivery_hashes = load_delivery_hashes(args.delivery_log, deadline)
+        paths, wanted_line = source_paths(args, deadline)
+        if not paths:
+            raise ValueError("no session source found")
+        matches = []
+        for fast_pass in ((True, False) if deadline is not None else (False,)):
+            for path in paths:
+                entries = matching_log_lines(path, words, delivery_hashes, deadline) if fast_pass else log_lines(path, delivery_hashes, deadline)
+                for line, offset, raw, (stamp, content) in entries:
+                    if wanted_line is not None and line > wanted_line:
+                        break
+                    if wanted_line is not None and line != wanted_line:
+                        continue
+                    if not contains_origin_quote(content, words):
+                        continue
+                    if not in_time_window(stamp, kind, expected, local_tz):
+                        continue
+                    matches.append((path, line, offset, raw, stamp, content))
+            if matches:
+                break
+        if len(matches) > 1:
+            print("provenance: multiple human messages matched; use a src reference:", file=sys.stderr)
+            for path, line, _, _, stamp, content in matches:
+                print(f"candidate: {stamp.isoformat()} {source_reference(path, line)} {' '.join(content.split())[:120]}", file=sys.stderr)
+            return 2
+        if not matches:
+            raise ValueError("no matching human message in the time window")
+        path, line, offset, raw, stamp, _ = matches[0]
+        receipt = {
+            "quote": words,
+            "ts": stamp.isoformat(),
+            "source": str(path.resolve()),
+            "src": source_reference(path, line),
+            "line": line,
+            "offset": offset,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+        return 0
+    except AmbiguousSource as exc:
+        print("provenance: src reference matches multiple sessions; use full --session or --source:", file=sys.stderr)
+        for path in exc.paths:
+            print(f"candidate: {path.resolve()}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, TimeoutError) as exc:
+        print(f"provenance: {exc}", file=sys.stderr)
+        return 1
+
+
+def format_human_quote(stamp: datetime, content: str, local_tz, iso: bool = False, legacy: bool = False) -> str:
+    local_time = stamp.astimezone(local_tz)
+    words = " ".join(content.split())
+    opening = "⟦U " if legacy else "𝕌"
+    if iso:
+        return f'{opening}{local_time.isoformat(timespec="seconds")} "{words}"⟧'
+    return f'{opening}{local_time.strftime("%m%d %H:%M")} {words}⟧'
+
+
+def quote(args: argparse.Namespace) -> int:
+    try:
+        local_tz = parse_timezone(args.tz)
+        deadline = time.monotonic() + 3.0 if not args.source and not args.session else None
+        delivery_hashes = load_delivery_hashes(args.delivery_log, deadline)
+        current = []
+        if not args.source and not args.session:
+            for key in ("PROVENANCE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID"):
+                session_id = os.environ.get(key)
+                if session_id:
+                    current = resolve_session(session_id)
+                    if current:
+                        break
+        paths, wanted_line = (current, None) if current else source_paths(args, deadline)
+        if not paths:
+            raise ValueError("no session source found")
+        matches = []
+        for fast_pass in ((True, False) if deadline is not None else (False,)):
+            for path in paths:
+                entries = matching_log_lines(path, args.fragment, delivery_hashes, deadline) if fast_pass else log_lines(path, delivery_hashes, deadline)
+                for line, _, _, (stamp, content) in entries:
+                    if wanted_line is not None and line > wanted_line:
+                        break
+                    if wanted_line is not None and line != wanted_line:
+                        continue
+                    if contains_origin_quote(content, args.fragment):
+                        matches.append((stamp, path, line, content))
+            if matches:
+                break
+        if not matches and current:
+            paths, wanted_line = source_paths(args, deadline)
+            for path in paths:
+                for line, _, _, (stamp, content) in matching_log_lines(path, args.fragment, delivery_hashes, deadline):
+                    if contains_origin_quote(content, args.fragment):
+                        matches.append((stamp, path, line, content))
+        if not matches:
+            raise ValueError("no matching human message")
+        if len(matches) > 1:
+            print("provenance: multiple human messages matched; provide a longer fragment:", file=sys.stderr)
+            for stamp, path, line, content in matches:
+                preview = " ".join(content.split())[:120]
+                print(f"candidate: {stamp.isoformat()} {source_reference(path, line)} {preview}", file=sys.stderr)
+            return 2
+        stamp, path, line, content = matches[0]
+        print(format_human_quote(stamp, content, local_tz, args.iso, args.legacy))
+        print(source_reference(path, line))
+        return 0
+    except AmbiguousSource as exc:
+        print("provenance: src reference matches multiple sessions; use full --session or --source:", file=sys.stderr)
+        for path in exc.paths:
+            print(f"candidate: {path.resolve()}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, TimeoutError) as exc:
+        print(f"provenance: {exc}", file=sys.stderr)
+        return 1
+
+
+def exact_quote_time(stamp: datetime, kind: str, expected: datetime | tuple[int, int, int, str], local_tz) -> bool:
+    if kind == "iso":
+        assert isinstance(expected, datetime)
+        return stamp.replace(microsecond=0) == expected.replace(microsecond=0)
+    assert isinstance(expected, tuple)
+    month, day, hour, minute = expected
+    local = stamp.astimezone(local_tz)
+    if minute.endswith("x"):
+        # An `Nx` window that contains the source minute is a valid (if
+        # coarse) citation, not a mismatch; only flag times outside it.
+        return (local.month, local.day, local.hour) == (month, day, hour) and local.minute // 10 == int(minute[0])
+    return (local.month, local.day, local.hour, local.minute) == (month, day, hour, int(minute))
+
+
+def corrected_fragment_quote(stamp: datetime, words: str, kind: str, expected: datetime | tuple[int, int, int, str], local_tz) -> str:
+    if kind == "iso":
+        assert isinstance(expected, datetime)
+        source_time = stamp.astimezone(expected.tzinfo)
+        return f'𝕌{source_time.isoformat(timespec="seconds")} "{words}"⟧'
+    source_time = stamp.astimezone(local_tz)
+    return f'𝕌{source_time.strftime("%m%d %H:%M")} {words}⟧'
+
+
+def hook_log_path() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME") or "~/.local/state").expanduser() / "provenance" / "hook.jsonl"
+
+
+def append_hook_record(record: dict) -> None:
+    """A failed diagnostic write must never change the hook decision."""
+    try:
+        path = hook_log_path()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def patch_added_lines(command: str) -> str:
+    """Inspect only lines introduced by apply_patch, never context or removals."""
+    return "\n".join(line[1:] for line in command.splitlines() if line.startswith("+"))
+
+
+def replace_patch_added_lines(command: str, rewritten: str) -> str:
+    added = iter(rewritten.split("\n"))
+    return "".join("+" + next(added) + ("\n" if line.endswith("\n") else "") if line.startswith("+")
+                   else line for line in command.splitlines(keepends=True))
+
+
+def hook_matches(path: Path, words: str, hashes: set[str], deadline: float):
+    found = []
+    for line, _, _, (stamp, message) in matching_log_lines(path, words, hashes, deadline):
+        if contains_origin_quote(message, words):
+            found.append((stamp, path, line))
+    if not found and path.stat().st_size < 8_000_000:
+        for line, _, _, (stamp, message) in log_lines(path, hashes, deadline):
+            if contains_origin_quote(message, words):
+                found.append((stamp, path, line))
+    return found
+
+
+def global_hook_matches(words: str, hashes: set[str], source_path: Path | None, deadline: float):
+    """Use ripgrep to shortlist recent transcripts before parsing human entries."""
+    paths = [path for path in recent_sessions(3, deadline) if path != source_path]
+    if not paths:
+        return []
+    escaped = json.dumps(words, ensure_ascii=True)[1:-1]
+    command = ["rg", "-l", "-0", "-F", "--no-ignore", "-e", words]
+    if escaped != words:
+        command += ["-e", escaped]
+    command += ["--", *(str(path) for path in paths)]
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("global source lookup exceeded time budget")
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("global source lookup exceeded time budget") from exc
+    if result.returncode not in (0, 1):
+        raise TimeoutError("global source lookup could not complete")
+    found = []
+    for raw_path in result.stdout.split(b"\0"):
+        if raw_path:
+            if time.monotonic() > deadline:
+                raise TimeoutError("global source lookup exceeded time budget")
+            found.extend(hook_matches(Path(os.fsdecode(raw_path)), words, hashes, deadline))
+    return found
+
+
+def hook(args: argparse.Namespace) -> int:
+    agent = getattr(args, "agent", "claude")
+    mode = getattr(args, "mode", "enforce")
+    started = time.monotonic()
+    deadline = started + getattr(args, "budget_ms", 3000) / 1000
+    verdict = "pass"
+    fragment = None
+    quote_count = 0
+    detail = None
+    session8 = ""
+    cwd = os.getcwd()
+    tool_name = ""
+    event_name = ""
+    try:
+        raw = sys.stdin.buffer.read(2_000_001)
+        if len(raw) > 2_000_000:
+            verdict = "error"
+            detail = "OversizedEvent"
+            return 0
+        event = json.loads(raw)
+        if not isinstance(event, dict) or not isinstance(event.get("tool_input"), dict):
+            verdict = "error"
+            detail = "InvalidEvent"
+            return 0
+        event_name, tool_name = event.get("hook_event_name"), event.get("tool_name")
+        event_name = event_name if isinstance(event_name, str) else ""
+        tool_name = tool_name if isinstance(tool_name, str) else ""
+        cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else cwd
+        source = event.get("transcript_path")
+        session = event.get("session_id")
+        if isinstance(session, str) and session:
+            session8 = session[:8]
+        elif isinstance(source, str) and source:
+            session8 = Path(source).stem[:8]
+        tool_input = event["tool_input"]
+        pre_bash = event_name == "PreToolUse" and tool_name == "Bash"
+        if pre_bash:
+            content = tool_input.get("command")
+        elif agent == "codex" and event_name == "PreToolUse" and tool_name == "apply_patch":
+            command = tool_input.get("command")
+            content = patch_added_lines(command) if isinstance(command, str) else None
+        elif event_name == "PreToolUse" and tool_name == "Write":
+            content = tool_input.get("content")
+        elif event_name == "PreToolUse" and tool_name == "Edit":
+            content = tool_input.get("new_string")
+        else:
+            return 0
+        if not isinstance(content, str) or not ("⟦U" in content or "𝕌" in content):
+            return 0
+        parsed = []
+        for match in HUMAN_QUOTE.finditer(content):
+            try:
+                words, kind, expected = parse_hook_quote(match.group(0))
+            except ValueError:
+                continue
+            parsed.append((match, words, kind, expected))
+        quote_count = len(parsed)
+        if not parsed:
+            return 0
+        local_tz = parse_timezone(args.tz)
+        delivery_warnings: list[str] = []
+        delivery_hashes = load_delivery_hashes(deadline=deadline, diagnostics=delivery_warnings)
+        if delivery_warnings:
+            detail = delivery_warnings[0]
+        source_path = Path(source).expanduser() if isinstance(source, str) and source else None
+        replacements = []
+        feedback = []
+        for match, words, kind, expected in parsed:
+            found = hook_matches(source_path, words, delivery_hashes, deadline) if source_path and source_path.is_file() else []
+            if not found:
+                found = global_hook_matches(words, delivery_hashes, source_path,
+                                            min(deadline, time.monotonic() + 0.8))
+            if len(found) > 1 and source_path and all(path == source_path for _, path, _ in found):
+                # In the current conversation, the latest direct human utterance wins.
+                found = [max(found, key=lambda item: item[2])]
+            if len(found) != 1:
+                if mode == "enforce":
+                    verdict = "deny"
+                    fragment = words
+                    reason = "找不到引文原話" if not found else "引文原話有多個候選，無法唯一定位"
+                    output = {"hookEventName": event_name, "permissionDecision": "deny",
+                              "permissionDecisionReason": f"{reason}，請核對：{match.group(0)}"}
+                    print(json.dumps({"hookSpecificOutput": output}, ensure_ascii=False))
+                    return 0
+                continue
+            stamp, found_path, line = found[0]
+            matches_time = kind != "missing" and exact_quote_time(stamp, kind, expected, local_tz)
+            approximate = isinstance(expected, tuple) and expected[3].endswith("x")
+            if matches_time and not approximate:
+                continue
+            correct = corrected_fragment_quote(stamp, words, kind, expected, local_tz)
+            replacements.append((match.start(), match.end(), correct))
+            feedback.append(source_reference(found_path, line))
+            fragment = words
+        if replacements:
+            for start, end, correct in reversed(replacements):
+                content = content[:start] + correct + content[end:]
+            field = "command" if pre_bash or agent == "codex" else "content" if tool_name == "Write" else "new_string"
+            updated = dict(tool_input)
+            updated[field] = replace_patch_added_lines(command, content) if agent == "codex" and tool_name == "apply_patch" else content
+            verdict = "rewrite" if mode == "enforce" else "feedback"
+            output = {"hookEventName": event_name,
+                      "additionalContext": f"已依原話修正 {len(replacements)} 處引文時間：{', '.join(item[2] for item in replacements)}（{', '.join(feedback)}）"}
+            if mode == "enforce":
+                output.update(permissionDecision="allow", updatedInput=updated)
+            print(json.dumps({"hookSpecificOutput": output}, ensure_ascii=False))
+        return 0
+    except TimeoutError as exc:
+        verdict = "timeout"
+        detail = type(exc).__name__
+        if quote_count and event_name == "PreToolUse":
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": event_name,
+                "permissionDecision": "allow",
+                "additionalContext": "引文未驗證（查詢逾時）；請勿當作已核實的 user 原話。"
+            }}, ensure_ascii=False))
+        return 0
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        verdict = "error"
+        detail = type(exc).__name__
+        return 0
+    finally:
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "agent": agent,
+            "session8": session8,
+            "cwd": cwd,
+            "tool": tool_name,
+            "event": event_name,
+            "verdict": verdict,
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+            "quote_count": quote_count,
+        }
+        if verdict in {"deny", "feedback", "rewrite"} and fragment is not None:
+            record["fragment_sha256"] = hashlib.sha256(fragment.encode("utf-8")).hexdigest()
+            record["fragment_preview"] = fragment[:20]
+        if detail:
+            record["detail"] = detail
+        append_hook_record(record)
+
+
+def hook_report(args: argparse.Namespace) -> int:
+    if args.hours <= 0:
+        print("provenance: --hours must be positive", file=sys.stderr)
+        return 1
+    path = hook_log_path()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+    records = []
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    record = json.loads(line)
+                    stamp = parse_time(record.get("ts", "")) if isinstance(record, dict) else None
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                record_agent = record.get("agent", "claude") if isinstance(record, dict) else None
+                if stamp and stamp >= cutoff and isinstance(record.get("verdict"), str) and (
+                    args.agent is None or record_agent == args.agent
+                ):
+                    records.append(record)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"provenance: {exc}", file=sys.stderr)
+        return 1
+    counts = {key: sum(record["verdict"] == key for record in records)
+              for key in ("pass", "rewrite", "deny", "feedback", "timeout", "error")}
+    durations = sorted(record["elapsed_ms"] for record in records
+                       if isinstance(record.get("elapsed_ms"), (int, float)) and not isinstance(record["elapsed_ms"], bool))
+    p50 = median(durations) if durations else 0
+    p95 = durations[math.ceil(0.95 * len(durations)) - 1] if durations else 0
+    print(f"hook events in last {args.hours:g}h: {len(records)}")
+    print("verdicts: " + " ".join(f"{key}={value}" for key, value in counts.items()))
+    print("agents: " + " ".join(f"{key}={sum(record.get('agent', 'claude') == key for record in records)}"
+                               for key in ("claude", "codex")))
+    print(f"elapsed_ms: p50={p50:g} p95={p95:g}")
+    for record in records:
+        if record["verdict"] in ("timeout", "error"):
+            print(f"{record['ts']} {record['verdict']} session8={record.get('session8', '')} "
+                  f"tool={record.get('tool', '')} cwd={record.get('cwd', '')} "
+                  f"elapsed_ms={record.get('elapsed_ms', '')} quotes={record.get('quote_count', '')} "
+                  f"detail={record.get('detail', '')}")
+    return 0
+
+
+def cited_source(body: str, document: Path) -> tuple[str, str] | None:
+    without_quotes = HUMAN_QUOTE.sub("", body)
+    match = SOURCE_REF.search(without_quotes)
+    if not match:
+        return None
+    kind, value = match.group("kind").lower(), match.group("value").strip("\"'")
+    if kind == "source" and value.lower() == "session":
+        session = re.match(r"\s+([A-Za-z0-9_-]+)", without_quotes[match.end():])
+        return ("--session", session.group(1)) if session else None
+    if kind == "session":
+        return "--session", value
+    if kind == "src":
+        return "--source", f"src: {value}"
+    source = Path(value).expanduser()
+    if not source.is_absolute():
+        source = document.parent / source
+    if not source.exists() and re.search(r":\d+$", value):
+        source = Path(re.sub(r":\d+$", "", str(source)))
+    return "--source", str(source)
+
+
+def quote_matches_source(quote: str, source: tuple[str, str]) -> bool:
+    command = [sys.executable, str(Path(__file__).resolve()), "verify", quote, source[0], source[1]]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def pending_claim(body: str, claim: re.Match[str]) -> bool:
+    before = body[:claim.start()]
+    sentence = re.split(r"[。！？!?;；\n]", before)[-1]
+    if PENDING_PREFIX.search(sentence):
+        return True
+    after = body[claim.end():]
+    return bool(re.match(r"\s*(?:待定|尚未|未決)", after))
+
+
+def lint(args: argparse.Namespace) -> int:
+    findings = 0
+    for name in args.files:
+        try:
+            lines = Path(name).read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print(f"provenance: {name}: {exc}", file=sys.stderr)
+            return 1
+        units = []
+        current_item = []
+        item_indent = None
+        fenced = False
+        for number, line in enumerate(lines, 1):
+            if line.strip().startswith("```"):
+                if current_item:
+                    units.append(current_item)
+                    current_item = []
+                    item_indent = None
+                fenced = not fenced
+                continue
+            if fenced or not line.strip():
+                if current_item:
+                    units.append(current_item)
+                    current_item = []
+                    item_indent = None
+                continue
+            marker = LIST_ITEM.match(line)
+            if marker:
+                if current_item:
+                    units.append(current_item)
+                current_item = [(number, line)]
+                item_indent = len(marker.group(1))
+                continue
+            indent = len(line) - len(line.lstrip())
+            if current_item and indent > item_indent:
+                current_item.append((number, line))
+            else:
+                if current_item:
+                    units.append(current_item)
+                    current_item = []
+                    item_indent = None
+                units.append([(number, line)])
+        if current_item:
+            units.append(current_item)
+        for unit in units:
+            body = "\n".join(line for _, line in unit)
+            quotes = list(HUMAN_QUOTE.finditer(body))
+            source = cited_source(body, Path(name)) if args.verify else None
+            for quote in quotes:
+                if REDUNDANT_QUOTE_PREFIX.search(body[:quote.start()]):
+                    line = unit[0][0] + body[:quote.start()].count("\n")
+                    print(f"{name}:{line}: redundant human quote prefix before 𝕌…⟧; remove the prefix")
+                    findings += 1
+                if INFERENCE_IN_QUOTE.search(quote.group(1)):
+                    line = unit[0][0] + body[:quote.start()].count("\n")
+                    print(f"{name}:{line}: inference inside human quote")
+                    findings += 1
+                if source and not quote.group(1).lstrip().startswith("#") and not quote_matches_source(quote.group(0), source):
+                    line = unit[0][0] + body[:quote.start()].count("\n")
+                    print(f"{name}:{line}: quote not found in source")
+                    findings += 1
+            without_quotes = HUMAN_QUOTE.sub("", body)
+            for number, line_text in unit:
+                remainder = re.sub(r"`[^`\n]*`", "", HUMAN_QUOTE.sub("", line_text))
+                for end in re.finditer(r"⟧|⦘", remainder):
+                    prefix = remainder[:end.start()]
+                    opening = ("⟦" in prefix or "𝕌" in prefix) if end.group() == "⟧" else bool(AGENT_MARKER.search(prefix) or re.search(r"[⟪⦅⟬]", prefix))
+                    if not opening:
+                        print(f"{name}:{number}: closing marker without opening marker")
+                        findings += 1
+            claim = next((match for match in HUMAN_CLAIM.finditer(without_quotes) if not pending_claim(without_quotes, match)), None)
+            if claim and not quotes:
+                line = unit[0][0] + without_quotes[:claim.start()].count("\n")
+                print(f"{name}:{line}: human decision or approval claim lacks 𝕌…⟧")
+                findings += 1
+    return 1 if findings else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="provenance")
+    commands = parser.add_subparsers(dest="command", required=True)
+    check = commands.add_parser("verify", help="verify a human quote against a local log")
+    check.add_argument("quote")
+    source = check.add_mutually_exclusive_group()
+    source.add_argument("--source", help="Claude/Codex JSONL, timestamped plain text log, or src: <session8>:<line>")
+    source.add_argument("--session", help="find a session by id in fixed Claude/Codex locations")
+    check.add_argument("--days", type=int, default=3, help="implicit lookup window in days (default: 3)")
+    check.add_argument("--tz", default="Asia/Taipei", help="timezone for MMDD quotes (IANA name or +HH:MM; default Asia/Taipei)")
+    check.add_argument("--delivery-log", help="append-only agent-delivery JSONL (default PROVENANCE_DELIVERY_LOG or local state path)")
+    quote_command = commands.add_parser("quote", help="quote a human message with its source timestamp")
+    quote_command.add_argument("fragment", help="distinctive words from the human message")
+    quote_source = quote_command.add_mutually_exclusive_group()
+    quote_source.add_argument("--source", help="Claude/Codex JSONL, timestamped plain text log, or src: <session8>:<line>")
+    quote_source.add_argument("--session", help="find a session by id in fixed Claude/Codex locations")
+    quote_command.add_argument("--days", type=int, default=3, help="implicit lookup window in days (default: 3)")
+    quote_command.add_argument("--iso", action="store_true", help="emit an ISO-8601 timestamp instead of MMDD HH:MM")
+    quote_command.add_argument("--legacy", action="store_true", help="emit the legacy ⟦U …⟧ format")
+    quote_command.add_argument("--tz", default="Asia/Taipei", help="output timezone (IANA name or +HH:MM; default Asia/Taipei)")
+    quote_command.add_argument("--delivery-log", help="append-only agent-delivery JSONL (default PROVENANCE_DELIVERY_LOG or local state path)")
+    hook_command = commands.add_parser("hook", help="check new tool input quotes against the current Claude session")
+    hook_command.add_argument("--tz", default="Asia/Taipei", help="local timezone for MMDD quotes (default Asia/Taipei)")
+    hook_command.set_defaults(agent="claude", mode="enforce")
+    codex_hook_command = commands.add_parser("codex-hook", help="check Codex Bash and apply_patch quote times")
+    codex_hook_command.add_argument("--tz", default="Asia/Taipei", help="local timezone for MMDD quotes (default Asia/Taipei)")
+    codex_hook_command.add_argument("--mode", choices=("shadow", "enforce"), default="shadow")
+    codex_hook_command.add_argument("--budget-ms", type=int, default=3000, help="internal scan budget (default: 3000 ms)")
+    codex_hook_command.set_defaults(agent="codex")
+    report_command = commands.add_parser("hook-report", help="summarize recent local hook events")
+    report_command.add_argument("--hours", type=float, default=24, help="lookback window in hours (default: 24)")
+    report_command.add_argument("--agent", choices=("claude", "codex"), help="show one agent; old records count as claude")
+    lint_command = commands.add_parser("lint", help="flag unsupported human authority claims")
+    lint_command.add_argument("files", nargs="+")
+    lint_command.add_argument("--verify", action="store_true", help="verify quotes in units that cite source or session")
+    args = parser.parse_args()
+    if args.command == "verify":
+        return verify(args)
+    if args.command == "quote":
+        return quote(args)
+    if args.command in ("hook", "codex-hook"):
+        return hook(args)
+    if args.command == "hook-report":
+        return hook_report(args)
+    return lint(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
